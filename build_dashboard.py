@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import json, math, os, time, gzip, statistics, re
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
 import requests
+import glob
 
 ROOT = Path('/Users/am/Code/btc5m-volume-rhythm-dashboard')
 OUT = ROOT / 'index.html'
@@ -188,6 +190,42 @@ def parse_pm_file(path):
     return serial
 
 
+def empty_grid(default=0):
+    return [[default for _ in range(24)] for __ in range(7)]
+
+def add_grid(grid, ms, val):
+    d, h, _ = hourkey(ms)
+    grid[d][h] += val
+
+def count_grid(grid, ms):
+    d, h, _ = hourkey(ms)
+    grid[d][h] += 1
+
+def avg_grid(sum_grid, n_grid, digits=4):
+    return [[round(sum_grid[d][h] / n_grid[d][h], digits) if n_grid[d][h] else 0 for h in range(24)] for d in range(7)]
+
+def parse_iso_ms(x):
+    if not x: return None
+    if isinstance(x, (int, float)): return int(x)
+    try:
+        return int(datetime.fromisoformat(str(x).replace('Z', '+00:00')).timestamp() * 1000)
+    except Exception:
+        return None
+
+def nested_get(o, paths):
+    for path in paths:
+        cur = o
+        ok = True
+        for part in path.split('.'):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                ok = False; break
+        if ok and isinstance(cur, (int, float)):
+            return float(cur)
+    return None
+
+
 def zgrid(mat):
     vals = [v for row in mat for v in row if v is not None]
     m = mean(vals) or 0
@@ -221,6 +259,21 @@ for row in fut:
     })
 metrics = ['futures_quote_usd', 'spot_quote_usd', 'trade_count', 'range_pct', 'abs_return_pct', 'taker_buy_share_pct', 'open_interest_usd', 'taker_buy_sell_ratio']
 agg, counts = aggregate(records, metrics)
+print('Fetching Binance 5m candles for whale/liquidation-regime overlays...', flush=True)
+fut5 = fetch_klines('https://fapi.binance.com', '/fapi/v1/klines', interval='5m')
+whale_count = empty_grid(0); five_range_sum = empty_grid(0.0); five_count = empty_grid(0); thin_bigmove_count = empty_grid(0)
+for row in fut5:
+    ts = int(row[0]); op=float(row[1]); hi=float(row[2]); lo=float(row[3]); cl=float(row[4]); quote=float(row[7])
+    rng = (hi-lo)/op*100 if op else 0
+    add_grid(five_range_sum, ts, rng); count_grid(five_count, ts)
+# dynamic thresholds from fetched 5m set
+quotes=[float(r[7]) for r in fut5]; ranges=[(float(r[2])-float(r[3]))/float(r[1])*100 for r in fut5 if float(r[1])]
+q_hi=sorted(quotes)[int(0.95*(len(quotes)-1))] if quotes else 0; q_lo=sorted(quotes)[int(0.25*(len(quotes)-1))] if quotes else 0; r_hi=sorted(ranges)[int(0.95*(len(ranges)-1))] if ranges else 0
+for row in fut5:
+    ts=int(row[0]); op=float(row[1]); hi=float(row[2]); lo=float(row[3]); quote=float(row[7]); rng=(hi-lo)/op*100 if op else 0
+    if quote >= q_hi or rng >= r_hi: count_grid(whale_count, ts)
+    if quote <= q_lo and rng >= r_hi: count_grid(thin_bigmove_count, ts)
+five_minute = {'avg_5m_range_pct': avg_grid(five_range_sum, five_count), 'whale_or_large_move_count': whale_count, 'thin_bigmove_count': thin_bigmove_count, 'thresholds': {'quote_usd_p95': q_hi, 'quote_usd_p25': q_lo, 'range_pct_p95': r_hi}}
 
 print('Aggregating local Polymarket BTC5M tape last_trade_price events...', flush=True)
 pm_files = discover_pm_files()
@@ -254,8 +307,120 @@ for src, p in pm_files:
 pm_notional = [[round(pm_cells[f'{d},{h}']['notional'], 2) for h in range(24)] for d in range(7)]
 pm_trades = [[pm_cells[f'{d},{h}']['trades'] for h in range(24)] for d in range(7)]
 pm_markets = [[len(pm_cells[f'{d},{h}']['markets']) for h in range(24)] for d in range(7)]
+
+print('Aggregating bot PnL, spread/depth, queue-risk, and resolution-window intensity...', flush=True)
+pnl_sum = empty_grid(0.0); pnl_count = empty_grid(0); pnl_sources = {}
+for tp in glob.glob(str(ART / '**/trades.jsonl'), recursive=True):
+    source = str(Path(tp).relative_to(ART))
+    try:
+        with open(tp, errors='ignore') as f:
+            for line in f:
+                if 'CLOSE' not in line and 'RESOLVE' not in line and 'TP_FILL' not in line and 'pnl' not in line.lower():
+                    continue
+                try: e=json.loads(line)
+                except Exception: continue
+                ms = parse_iso_ms(e.get('ts') or e.get('closedAt') or nested_get(e, ['position.closedAt']))
+                if ms is None or ms < PM_START_MS: continue
+                val = nested_get(e, ['pnlUsd','pnl','realizedPnlUsd','realizedPnl','position.pnlUsd','position.holdPnl','position.tpPnl','position.realizedPnlUsd'])
+                if val is None: continue
+                add_grid(pnl_sum, ms, val); count_grid(pnl_count, ms); pnl_sources[source]=pnl_sources.get(source,0)+1
+    except Exception:
+        pass
+pnl_avg = avg_grid(pnl_sum, pnl_count)
+
+# Maker risk from parsed CLOB tape: average spread, top depth, and late-window trade intensity.
+spread_sum = empty_grid(0.0); spread_count = empty_grid(0); depth_sum = empty_grid(0.0); depth_count = empty_grid(0); late_trade_count = empty_grid(0)
+# Use cached parsed files for trades, then scan present PM files for book events. Limit to files already discovered.
+for src, fp in pm_files:
+    path = Path(fp)
+    # Full book-event scans are expensive on the actively-growing ~20GB raw chunk;
+    # include compressed completed chunks and smaller one-off tapes, skip huge raw files.
+    if path.stat().st_size > 4_000_000_000 and not str(path).endswith('.gz'):
+        continue
+    opener = gzip.open if str(path).endswith('.gz') else open
+    try:
+        with opener(path, 'rt', errors='ignore') as f:
+            for line in f:
+                if 'btc-updown-5m-' not in line: continue
+                try: e=json.loads(line)
+                except Exception: continue
+                ms=int(e.get('receivedAtMs') or 0);
+                if ms < PM_START_MS: continue
+                et=e.get('eventType'); payload=e.get('payload') or {}
+                if et=='book':
+                    try:
+                        bids=payload.get('bids') or []; asks=payload.get('asks') or []
+                        if bids and asks:
+                            bb=max(float(x['price']) for x in bids); aa=min(float(x['price']) for x in asks); sp=max(0,aa-bb)
+                            top_depth=sum(float(x.get('size') or 0) for x in bids[:3]+asks[:3])
+                            add_grid(spread_sum, ms, sp); count_grid(spread_count, ms); add_grid(depth_sum, ms, top_depth); count_grid(depth_count, ms)
+                    except Exception: pass
+                elif et=='last_trade_price':
+                    end=int(e.get('marketEndTs') or 0)*1000
+                    if end and 0 <= end-ms <= 60_000: count_grid(late_trade_count, ms)
+    except Exception:
+        pass
+spread_avg = avg_grid(spread_sum, spread_count, 4); depth_avg = avg_grid(depth_sum, depth_count, 1)
+queue_risk = [[round((spread_avg[d][h]*100) + (late_trade_count[d][h]/max(1, pm_trades[d][h]))*20 + (1/max(1, depth_avg[d][h]))*1000, 2) for h in range(24)] for d in range(7)]
+
+print('Fetching current Deribit BTC options snapshot...', flush=True)
+deribit_options = {'status':'unavailable'}
+try:
+    r=requests.get('https://www.deribit.com/api/v2/public/get_book_summary_by_currency', params={'currency':'BTC','kind':'option'}, timeout=30)
+    arr=r.json().get('result') or []
+    vol_usd=sum(float(x.get('volume_usd') or 0) for x in arr)
+    oi_btc=sum(float(x.get('open_interest') or 0) for x in arr)
+    ivs=[float(x.get('mark_iv')) for x in arr if x.get('mark_iv') is not None]
+    deribit_options={'status':'ok','instrument_count':len(arr),'volume_usd_24h':round(vol_usd,2),'open_interest_btc':round(oi_btc,4),'avg_mark_iv':round(mean(ivs) or 0,2),'source':'Deribit public get_book_summary_by_currency current snapshot'}
+except Exception as ex:
+    deribit_options={'status':'error','error':str(ex)}
 zvol = zgrid(agg['futures_quote_usd']); ztr = zgrid(agg['trade_count']); zrg = zgrid(agg['range_pct'])
 activity = [[round(50 + 12 * (zvol[d][h] + ztr[d][h] + zrg[d][h]) / 3, 1) for h in range(24)] for d in range(7)]
+
+# Convert descriptive metrics into a first-pass operating schedule.
+bot_schedule = []
+for d in range(7):
+    for h in range(24):
+        risk = 0
+        reasons = []
+        if d >= 5:
+            risk += 2; reasons.append('weekend')
+        if h <= 8 or h >= 22:
+            risk += 1; reasons.append('UTC night')
+        if five_minute['thin_bigmove_count'][d][h] > 0:
+            risk += 2; reasons.append('thin big-move history')
+        if queue_risk[d][h] > 12:
+            risk += 2; reasons.append('high maker queue-risk')
+        if pnl_count[d][h] >= 3 and pnl_sum[d][h] < 0:
+            risk += 2; reasons.append('negative local bot PnL')
+        if risk >= 5:
+            action = 'DISABLE_OR_COLLECT_ONLY'
+        elif risk >= 3:
+            action = 'HALF_SIZE_OR_NO_MAKER'
+        elif activity[d][h] >= 60 and queue_risk[d][h] < 10:
+            action = 'NORMAL_SIZE_ALLOWED_IF_STRATEGY_EDGE_EXISTS'
+        else:
+            action = 'NORMAL_RESEARCH_ONLY'
+        bot_schedule.append({'day': WD[d], 'hour_utc': h, 'action': action, 'risk_score': risk, 'reasons': reasons})
+
+print('Scanning active Polymarket next-market candidates...', flush=True)
+next_markets = []
+try:
+    arr = get_json('https://gamma-api.polymarket.com/markets', {'closed':'false','active':'true','limit':500,'offset':0,'order':'volume24hr','ascending':'false'})
+    for m in arr:
+        slug = str(m.get('slug','')).lower(); q = str(m.get('question','')).lower()
+        vol = float(m.get('volume24hr') or m.get('volumeNum') or 0); liq = float(m.get('liquidityNum') or m.get('liquidity') or 0); spread = float(m.get('spread') or 0) if m.get('spread') not in [None,''] else None
+        if 'updown-5m' in slug or '5m' in slug: continue
+        tags = []
+        if any(x in slug or x in q for x in ['bitcoin','btc','ethereum','eth','crypto','solana','sol ']): tags.append('crypto-slower')
+        if any(x in slug or x in q for x in ['election','trump','fed','rate','cpi','inflation','sec','lawsuit']): tags.append('news/macro')
+        if any(x in slug or x in q for x in ['nba','nfl','mlb','soccer','uefa','fifa','game']): tags.append('sports')
+        if not tags: continue
+        score = vol + 0.2*liq - (spread or 0)*10000
+        next_markets.append({'question':m.get('question'), 'slug':m.get('slug'), 'volume24hr':round(vol,2), 'liquidity':round(liq,2), 'spread':spread, 'tags':tags, 'score':round(score,2)})
+    next_markets = sorted(next_markets, key=lambda x:x['score'], reverse=True)[:12]
+except Exception as ex:
+    next_markets = [{'error': str(ex)}]
 
 suggestions = [
     {'title': 'Add realized PnL overlay by weekday/hour', 'why': 'Directly shows which hours actually made or lost money for each bot lane, not just where BTC was active.'},
@@ -279,8 +444,14 @@ snap = {
     'binance_metrics': agg,
     'binance_counts': counts,
     'polymarket': {'notional_usd_raw': pm_notional, 'trade_events': pm_trades, 'markets_touched': pm_markets, 'meta': pm_meta},
+    'bot_pnl': {'avg_pnl_usd': pnl_avg, 'trade_count': pnl_count, 'sum_pnl_usd': [[round(pnl_sum[d][h],4) for h in range(24)] for d in range(7)], 'sources': pnl_sources},
+    'maker_risk': {'avg_spread': spread_avg, 'avg_top_depth': depth_avg, 'queue_risk_score': queue_risk, 'late_trade_count': late_trade_count},
+    'five_minute': five_minute,
+    'deribit_options': deribit_options,
     'composite_activity': activity,
     'suggestions': suggestions,
+    'bot_schedule': bot_schedule,
+    'next_markets': next_markets,
     'notes': [
         'Binance spot/futures are public hourly BTCUSDT data from Binance, aggregated by UTC weekday/hour over the lookback window.',
         'Derivatives activity proxies: Binance USD-M futures quote volume, trade count, taker buy share, taker buy/sell ratio, and futures open interest. Historical BTC options volume is not included in this cut.',
@@ -291,7 +462,7 @@ snap = {
 }
 DATA_JSON.write_text(json.dumps(snap, separators=(',', ':')))
 
-html_template = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BTC / Polymarket BTC5M Weekly Activity Rhythm</title><style>:root{--bg:#07080b;--panel:#0f1117;--panel2:#151925;--text:#f5f7fb;--muted:#9aa4b2;--grid:#273043;--accent:#7dd3fc;--hot:#fb923c}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0%,#172033 0,#07080b 38%,#050507 100%);color:var(--text);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1380px;margin:0 auto;padding:34px 22px 70px}h1{font-size:42px;line-height:1.02;margin:0 0 12px;letter-spacing:-.04em}h2{font-size:22px;margin:30px 0 12px}h3{font-size:15px;margin:0 0 8px;color:#dbeafe}.sub{color:var(--muted);max-width:980px;font-size:16px}.pill{display:inline-block;border:1px solid #334155;background:#0b1220;border-radius:999px;padding:5px 10px;margin:4px 6px 4px 0;color:#cbd5e1;font-size:12px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:24px 0}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px}.card{background:linear-gradient(180deg,rgba(21,25,37,.92),rgba(10,12,18,.92));border:1px solid #20283a;border-radius:18px;padding:18px;box-shadow:0 16px 50px rgba(0,0,0,.25)}.metric{font-size:28px;font-weight:750;letter-spacing:-.04em}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.heatwrap{overflow-x:auto;border:1px solid #20283a;border-radius:16px;background:#0a0d13;padding:12px;margin-bottom:22px}table.heat{border-collapse:separate;border-spacing:3px;width:100%;min-width:900px}.heat th{font-size:11px;color:#94a3b8;font-weight:500;text-align:center;padding:4px}.heat td{height:32px;border-radius:7px;text-align:center;font-size:11px;color:#e5e7eb;border:1px solid rgba(255,255,255,.04);min-width:34px;position:relative}.heat td:hover{outline:2px solid #e0f2fe;z-index:2}.legend{display:flex;gap:8px;align-items:center;color:#94a3b8;font-size:12px;margin:8px 0 14px}.bar{height:9px;width:180px;border-radius:99px;background:linear-gradient(90deg,#111827,#164e63,#0ea5e9,#f59e0b,#ef4444)}.section{display:grid;grid-template-columns:1.3fr .7fr;gap:18px;align-items:start}.note{color:#aab4c3;background:#09111d;border:1px solid #1e293b;border-radius:14px;padding:14px;margin:10px 0}.warn{border-left:3px solid var(--hot)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}ul{padding-left:20px}.suggestions li{margin:10px 0}.small{font-size:12px;color:#94a3b8}a{color:#7dd3fc}@media(max-width:900px){.grid,.twocol,.section{grid-template-columns:1fr}h1{font-size:32px}}</style></head><body><main><div class="pill">UTC heatmaps</div><div class="pill">Binance DAYS_PLACEHOLDERd baseline</div><div class="pill">Polymarket local CLOB tape</div><div class="pill">paper/research only</div><h1>BTC / BTC5M Weekly Liquidity Rhythm</h1><p class="sub">A shareable operating dashboard for deciding when BTC5M bots are swimming with liquidity vs. being exposed to thin overnight/weekend microstructure. Cells are weekday × UTC hour. Binance metrics are averaged over the last DAYS_PLACEHOLDER days; Polymarket BTC5M cells come from Studio1 local CLOB tape <span class="mono">last_trade_price</span> events.</p><div class="grid" id="cards"></div><div class="note warn"><b>Read this correctly:</b> high BTC futures volume/open interest means the global BTC market is active; it does not prove Polymarket BTC5M edge. Thin hours are risk flags for stale quotes, whale impact, and adverse selection. Options history is not in this cut; futures/open-interest/taker flow are used as derivatives proxies.</div><div class="twocol"><div class="card"><h3>Polymarket tape coverage</h3><div id="coverage"></div></div><div class="card"><h3>Ten upgrades to make this more profitable</h3><ol class="suggestions" id="suggestions"></ol></div></div><div id="heatmaps"></div><h2>Operational takeaways</h2><div class="section"><div class="card"><h3>How to use this for bots</h3><ul><li>Prefer evaluation/trading windows where futures volume, trade count, and Polymarket BTC5M trade events are simultaneously high.</li><li>Treat low-volume UTC night/weekend cells as adverse-selection zones: widen gates, reduce size, or disable maker quotes.</li><li>Compare weekday vs weekend: if weekend derivatives activity is low and range is high, avoid strategies trained on weekday flow.</li><li>For BTC5M specifically, each UTC hour contains 12 market resolutions. <span class="mono">markets_touched</span> approximates how many 5m windows had local observed trades.</li></ul></div><div class="card"><h3>Data caveats</h3><div id="notes"></div></div></div><script id="snapshot" type="application/json">SNAPSHOT_JSON_PLACEHOLDER</script><script>const S=JSON.parse(document.getElementById('snapshot').textContent);const WD=S.weekday_labels;function flat(mat){return mat.flat().filter(x=>Number.isFinite(x));}function fmt(v,kind){if(v==null)return'—';if(kind==='usd')return'$'+(v>=1e9?(v/1e9).toFixed(2)+'B':v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v.toFixed(0));if(kind==='pct')return v.toFixed(2)+'%';if(kind==='num')return v>=1000?(v/1000).toFixed(1)+'k':v.toFixed(1);return String(Math.round(v));}function color(v,vals){const min=Math.min(...vals),max=Math.max(...vals);const t=max>min?(v-min)/(max-min):0;const hue=220-210*t;return `hsl(${hue} 70% ${12+42*t}%)`;}function heat(title,mat,kind,desc){const vals=flat(mat);let html=`<h2>${title}</h2><p class="sub">${desc}</p><div class="legend"><span>low</span><div class="bar"></div><span>high</span></div><div class="heatwrap"><table class="heat"><thead><tr><th>day/hour</th>${S.hour_labels.map(h=>`<th>${h.slice(0,2)}</th>`).join('')}</tr></thead><tbody>`;for(let d=0;d<7;d++){html+=`<tr><th>${WD[d]}</th>`;for(let h=0;h<24;h++){const v=mat[d][h]||0;html+=`<td style="background:${color(v,vals)}" title="${WD[d]} ${S.hour_labels[h]} UTC: ${fmt(v,kind)}">${kind==='usd'?fmt(v,kind).replace('$',''):fmt(v,kind).replace('%','')}</td>`;}html+='</tr>';}return html+'</tbody></table></div>';}const B=S.binance_metrics,P=S.polymarket;document.getElementById('cards').innerHTML=[['Binance hours',S.binance_hours.toLocaleString(),`${S.days}d hourly sample`],['Avg futures volume',fmt(flat(B.futures_quote_usd).reduce((a,b)=>a+b,0)/flat(B.futures_quote_usd).length,'usd'),'BTCUSDT perp quote volume / hour'],['Avg range',fmt(flat(B.range_pct).reduce((a,b)=>a+b,0)/flat(B.range_pct).length,'pct'),'high-low/open per hour'],['PM tape trades',P.meta.events.toLocaleString(),`${P.meta.processed_files.length} local files parsed`]].map(c=>`<div class="card"><div class="label">${c[0]}</div><div class="metric">${c[1]}</div><div class="sub">${c[2]}</div></div>`).join('');document.getElementById('coverage').innerHTML=`<p><b>${P.meta.events.toLocaleString()}</b> BTC5M trade events, <b>${fmt(P.meta.bytes_scanned,'num')}</b> bytes scanned.</p><p>First event: <span class="mono">${P.meta.first_event_utc||'n/a'}</span><br>Last event: <span class="mono">${P.meta.last_event_utc||'n/a'}</span></p><p class="small">${P.meta.missing_manifest_files}</p>`;document.getElementById('suggestions').innerHTML=S.suggestions.map(s=>`<li><b>${s.title}</b><br><span class="small">${s.why}</span></li>`).join('');let html='';html+=heat('Composite BTC activity score',S.composite_activity,'num','Z-score blend of Binance futures volume, trade count, and hourly range. Use this as the quickest “how awake is BTC?” map.');html+=heat('Binance BTCUSDT futures quote volume — mean USD/hour',B.futures_quote_usd,'usd','Primary global derivatives liquidity proxy. Thin cells are where whales can move local microstructure more easily.');html+=heat('Binance BTCUSDT spot quote volume — mean USD/hour',B.spot_quote_usd,'usd','Spot market participation by weekday/hour.');html+=heat('Hourly BTC range — mean %',B.range_pct,'pct','Price variance proxy: high range with low volume is especially dangerous for stale BTC5M makers.');html+=heat('Futures taker buy share — mean %',B.taker_buy_share_pct,'pct','Directional taker aggression proxy. Deviations from 50% show one-sided futures pressure.');html+=heat('Futures open interest — mean USD',B.open_interest_usd,'usd','Derivative positioning/open interest proxy. High OI with low volume can mean liquidation/stop-run risk.');html+=heat('Polymarket BTC5M local trade notional — raw USD/hour',P.notional_usd_raw,'usd','Local Studio1 CLOB websocket tape. Not averaged over 60d; this is observed BTC5M Polymarket trade flow in parsed chunks and historical one-off orderbook tapes still present.');html+=heat('Polymarket BTC5M trade events — raw count/hour',P.trade_events,'num','Number of local BTC5M last_trade_price events seen by hour.');html+=heat('Polymarket BTC5M windows touched — count/hour',P.markets_touched,'num','How many 5-minute BTC up/down market slugs traded in that UTC hour in the local tape; max is roughly 12 per hour per side/window set.');document.getElementById('heatmaps').innerHTML=html;document.getElementById('notes').innerHTML=S.notes.map(n=>`<p>${n}</p>`).join('')+`<p class="mono">generated_at_utc=${S.generated_at_utc}</p>`;</script></main></body></html>'''
+html_template = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BTC / Polymarket BTC5M Weekly Activity Rhythm</title><style>:root{--bg:#07080b;--panel:#0f1117;--panel2:#151925;--text:#f5f7fb;--muted:#9aa4b2;--grid:#273043;--accent:#7dd3fc;--hot:#fb923c}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0%,#172033 0,#07080b 38%,#050507 100%);color:var(--text);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1380px;margin:0 auto;padding:34px 22px 70px}h1{font-size:42px;line-height:1.02;margin:0 0 12px;letter-spacing:-.04em}h2{font-size:22px;margin:30px 0 12px}h3{font-size:15px;margin:0 0 8px;color:#dbeafe}.sub{color:var(--muted);max-width:980px;font-size:16px}.pill{display:inline-block;border:1px solid #334155;background:#0b1220;border-radius:999px;padding:5px 10px;margin:4px 6px 4px 0;color:#cbd5e1;font-size:12px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:24px 0}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px}.card{background:linear-gradient(180deg,rgba(21,25,37,.92),rgba(10,12,18,.92));border:1px solid #20283a;border-radius:18px;padding:18px;box-shadow:0 16px 50px rgba(0,0,0,.25)}.metric{font-size:28px;font-weight:750;letter-spacing:-.04em}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.heatwrap{overflow-x:auto;border:1px solid #20283a;border-radius:16px;background:#0a0d13;padding:12px;margin-bottom:22px}table.heat{border-collapse:separate;border-spacing:3px;width:100%;min-width:900px}.heat th{font-size:11px;color:#94a3b8;font-weight:500;text-align:center;padding:4px}.heat td{height:32px;border-radius:7px;text-align:center;font-size:11px;color:#e5e7eb;border:1px solid rgba(255,255,255,.04);min-width:34px;position:relative}.heat td:hover{outline:2px solid #e0f2fe;z-index:2}.legend{display:flex;gap:8px;align-items:center;color:#94a3b8;font-size:12px;margin:8px 0 14px}.bar{height:9px;width:180px;border-radius:99px;background:linear-gradient(90deg,#111827,#164e63,#0ea5e9,#f59e0b,#ef4444)}.section{display:grid;grid-template-columns:1.3fr .7fr;gap:18px;align-items:start}.note{color:#aab4c3;background:#09111d;border:1px solid #1e293b;border-radius:14px;padding:14px;margin:10px 0}.warn{border-left:3px solid var(--hot)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}ul{padding-left:20px}.suggestions li{margin:10px 0}.small{font-size:12px;color:#94a3b8}a{color:#7dd3fc}@media(max-width:900px){.grid,.twocol,.section{grid-template-columns:1fr}h1{font-size:32px}}</style></head><body><main><div class="pill">UTC heatmaps</div><div class="pill">Binance DAYS_PLACEHOLDERd baseline</div><div class="pill">Polymarket local CLOB tape</div><div class="pill">paper/research only</div><h1>BTC / BTC5M Weekly Liquidity Rhythm</h1><p class="sub">A shareable operating dashboard for deciding when BTC5M bots are swimming with liquidity vs. being exposed to thin overnight/weekend microstructure. Cells are weekday × UTC hour. Binance metrics are averaged over the last DAYS_PLACEHOLDER days; Polymarket BTC5M cells come from Studio1 local CLOB tape <span class="mono">last_trade_price</span> events.</p><div class="grid" id="cards"></div><div class="note warn"><b>Read this correctly:</b> high BTC futures volume/open interest means the global BTC market is active; it does not prove Polymarket BTC5M edge. Thin hours are risk flags for stale quotes, whale impact, and adverse selection. Options history is not in this cut; futures/open-interest/taker flow are used as derivatives proxies.</div><div class="twocol"><div class="card"><h3>Polymarket tape coverage</h3><div id="coverage"></div></div><div class="card"><h3>Deribit BTC options snapshot</h3><div id="deribit"></div></div></div><div class="card"><h3>Ten upgrades to make this more profitable</h3><ol class="suggestions" id="suggestions"></ol></div><div class="twocol"><div class="card"><h3>First-pass bot schedule</h3><div id="schedule"></div></div><div class="card"><h3>Recommended next-market scan</h3><div id="nextmarkets"></div></div></div><div id="heatmaps"></div><h2>Operational takeaways</h2><div class="section"><div class="card"><h3>How to use this for bots</h3><ul><li>Prefer evaluation/trading windows where futures volume, trade count, and Polymarket BTC5M trade events are simultaneously high.</li><li>Treat low-volume UTC night/weekend cells as adverse-selection zones: widen gates, reduce size, or disable maker quotes.</li><li>Compare weekday vs weekend: if weekend derivatives activity is low and range is high, avoid strategies trained on weekday flow.</li><li>For BTC5M specifically, each UTC hour contains 12 market resolutions. <span class="mono">markets_touched</span> approximates how many 5m windows had local observed trades.</li></ul></div><div class="card"><h3>Data caveats</h3><div id="notes"></div></div></div><script id="snapshot" type="application/json">SNAPSHOT_JSON_PLACEHOLDER</script><script>const S=JSON.parse(document.getElementById('snapshot').textContent);const WD=S.weekday_labels;function flat(mat){return mat.flat().filter(x=>Number.isFinite(x));}function fmt(v,kind){if(v==null)return'—';if(kind==='usd')return'$'+(v>=1e9?(v/1e9).toFixed(2)+'B':v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v.toFixed(0));if(kind==='pct')return v.toFixed(2)+'%';if(kind==='num')return v>=1000?(v/1000).toFixed(1)+'k':v.toFixed(1);return String(Math.round(v));}function color(v,vals){const min=Math.min(...vals),max=Math.max(...vals);const t=max>min?(v-min)/(max-min):0;const hue=220-210*t;return `hsl(${hue} 70% ${12+42*t}%)`;}function heat(title,mat,kind,desc){const vals=flat(mat);let html=`<h2>${title}</h2><p class="sub">${desc}</p><div class="legend"><span>low</span><div class="bar"></div><span>high</span></div><div class="heatwrap"><table class="heat"><thead><tr><th>day/hour</th>${S.hour_labels.map(h=>`<th>${h.slice(0,2)}</th>`).join('')}</tr></thead><tbody>`;for(let d=0;d<7;d++){html+=`<tr><th>${WD[d]}</th>`;for(let h=0;h<24;h++){const v=mat[d][h]||0;html+=`<td style="background:${color(v,vals)}" title="${WD[d]} ${S.hour_labels[h]} UTC: ${fmt(v,kind)}">${kind==='usd'?fmt(v,kind).replace('$',''):fmt(v,kind).replace('%','')}</td>`;}html+='</tr>';}return html+'</tbody></table></div>';}const B=S.binance_metrics,P=S.polymarket,PNL=S.bot_pnl,MR=S.maker_risk,F5=S.five_minute,DOPT=S.deribit_options;document.getElementById('cards').innerHTML=[['Binance hours',S.binance_hours.toLocaleString(),`${S.days}d hourly sample`],['Avg futures volume',fmt(flat(B.futures_quote_usd).reduce((a,b)=>a+b,0)/flat(B.futures_quote_usd).length,'usd'),'BTCUSDT perp quote volume / hour'],['Avg range',fmt(flat(B.range_pct).reduce((a,b)=>a+b,0)/flat(B.range_pct).length,'pct'),'high-low/open per hour'],['PM tape trades',P.meta.events.toLocaleString(),`${P.meta.processed_files.length} local files parsed`]].map(c=>`<div class="card"><div class="label">${c[0]}</div><div class="metric">${c[1]}</div><div class="sub">${c[2]}</div></div>`).join('');document.getElementById('coverage').innerHTML=`<p><b>${P.meta.events.toLocaleString()}</b> BTC5M trade events, <b>${fmt(P.meta.bytes_scanned,'num')}</b> bytes scanned.</p><p>First event: <span class="mono">${P.meta.first_event_utc||'n/a'}</span><br>Last event: <span class="mono">${P.meta.last_event_utc||'n/a'}</span></p><p class="small">${P.meta.missing_manifest_files}</p>`;document.getElementById('deribit').innerHTML=DOPT.status==='ok'?`<p><b>${fmt(DOPT.volume_usd_24h,'usd')}</b> 24h BTC options volume, <b>${DOPT.open_interest_btc.toLocaleString()}</b> BTC open interest.</p><p>Avg mark IV: <b>${DOPT.avg_mark_iv}%</b><br>Instruments: <b>${DOPT.instrument_count}</b></p><p class="small">${DOPT.source}</p>`:`<p class="small">Deribit unavailable: ${DOPT.error||DOPT.status}</p>`;document.getElementById('suggestions').innerHTML=S.suggestions.map(s=>`<li><b>${s.title}</b><br><span class="small">${s.why}</span></li>`).join('');const danger=S.bot_schedule.filter(x=>x.action==='DISABLE_OR_COLLECT_ONLY').slice(0,12);document.getElementById('schedule').innerHTML=`<p><b>${danger.length}</b> highest-risk weekday/hour buckets shown below. Use as a first-pass no-trade/collect-only map, not a live instruction.</p>`+danger.map(x=>`<p class="small"><b>${x.day} ${String(x.hour_utc).padStart(2,'0')}:00 UTC</b> — ${x.action} (${x.reasons.join(', ')||'baseline'})</p>`).join('');document.getElementById('nextmarkets').innerHTML=S.next_markets.map(m=>m.error?`<p>${m.error}</p>`:`<p class="small"><b>${m.question}</b><br>${m.tags.join(', ')} · vol24h ${fmt(m.volume24hr,'usd')} · liq ${fmt(m.liquidity,'usd')} · spread ${m.spread??'n/a'}</p>`).join('');let html='';html+=heat('Composite BTC activity score',S.composite_activity,'num','Z-score blend of Binance futures volume, trade count, and hourly range. Use this as the quickest “how awake is BTC?” map.');html+=heat('Binance BTCUSDT futures quote volume — mean USD/hour',B.futures_quote_usd,'usd','Primary global derivatives liquidity proxy. Thin cells are where whales can move local microstructure more easily.');html+=heat('Binance BTCUSDT spot quote volume — mean USD/hour',B.spot_quote_usd,'usd','Spot market participation by weekday/hour.');html+=heat('Hourly BTC range — mean %',B.range_pct,'pct','Price variance proxy: high range with low volume is especially dangerous for stale BTC5M makers.');html+=heat('Futures taker buy share — mean %',B.taker_buy_share_pct,'pct','Directional taker aggression proxy. Deviations from 50% show one-sided futures pressure.');html+=heat('Futures open interest — mean USD',B.open_interest_usd,'usd','Derivative positioning/open interest proxy. High OI with low volume can mean liquidation/stop-run risk.');html+=heat('Bot realized PnL — average USD/trade by close hour',PNL.avg_pnl_usd,'usd','Parsed local trades.jsonl CLOSE/RESOLVE/TP rows. This is the money overlay: which weekday/hour buckets actually made or lost money in paper/live-shadow artifacts.');html+=heat('Bot trade count — closed/scored positions',PNL.trade_count,'num','Sample size behind the PnL heatmap. Low-count buckets are not trustworthy yet.');html+=heat('Binance 5m whale / large-move count',F5.whale_or_large_move_count,'num','Count of 5-minute candles in each hour bucket above the 95th percentile for volume or range.');html+=heat('Thin-liquidity big-move count',F5.thin_bigmove_count,'num','Danger regime: low 5m quote volume but high range. Good candidate for no-trade / reduced-size rules.');html+=heat('Average 5m BTC range — %',F5.avg_5m_range_pct,'pct','Direct 5-minute volatility view rather than hourly smoothing.');html+=heat('Maker queue-risk score',MR.queue_risk_score,'num','Composite of spread, late-window trade intensity, and shallow top depth from BTC5M CLOB book/trade tape. Higher = more adverse-selection risk.');html+=heat('Average Polymarket BTC5M spread',MR.avg_spread,'pct','Average best ask minus best bid from local CLOB book events. Wide spreads imply taker cost; narrow spreads can still be toxic if queue risk is high.');html+=heat('Late-window BTC5M trade count',MR.late_trade_count,'num','Trades inside the last 60 seconds before market end. This approximates resolution-window intensity and last-minute flip pressure.');html+=heat('Polymarket BTC5M local trade notional — raw USD/hour',P.notional_usd_raw,'usd','Local Studio1 CLOB websocket tape. Not averaged over 60d; this is observed BTC5M Polymarket trade flow in parsed chunks and historical one-off orderbook tapes still present.');html+=heat('Polymarket BTC5M trade events — raw count/hour',P.trade_events,'num','Number of local BTC5M last_trade_price events seen by hour.');html+=heat('Polymarket BTC5M windows touched — count/hour',P.markets_touched,'num','How many 5-minute BTC up/down market slugs traded in that UTC hour in the local tape; max is roughly 12 per hour per side/window set.');document.getElementById('heatmaps').innerHTML=html;document.getElementById('notes').innerHTML=S.notes.map(n=>`<p>${n}</p>`).join('')+`<p class="mono">generated_at_utc=${S.generated_at_utc}</p>`;</script></main></body></html>'''
 html = html_template.replace('DAYS_PLACEHOLDER', str(DAYS)).replace('SNAPSHOT_JSON_PLACEHOLDER', json.dumps(snap))
 OUT.write_text(html)
 print(f'wrote {OUT} bytes={OUT.stat().st_size}')
