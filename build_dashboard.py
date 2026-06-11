@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import json, math, os, time, gzip, statistics, re
+import json, math, os, time, gzip, statistics, re, html as html_lib
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -232,6 +232,123 @@ def zgrid(mat):
     sd = statistics.pstdev(vals) if len(vals) > 1 else 1
     return [[(v - m) / (sd or 1) for v in row] for row in mat]
 
+
+
+
+def summarize_lane(name, family, path, screen_name=None, screens_text=''):
+    p = Path(path)
+    row = {'name': name, 'family': family, 'path': str(p), 'screen': screen_name, 'running': bool(screen_name and screen_name in screens_text), 'exists': p.exists()}
+    if not p.exists():
+        row['verdict'] = 'MISSING_SUMMARY'
+        return row
+    try:
+        j = json.load(open(p))
+    except Exception as ex:
+        row.update({'verdict':'BAD_JSON','error':str(ex)})
+        return row
+    row.update({'paperOnly': j.get('paperOnly'), 'liveOrderSubmission': j.get('liveOrderSubmission'), 'signedOrders': j.get('signedOrders'), 'postedOrders': j.get('postedOrders'), 'startedAt': j.get('startedAt') or j.get('ts'), 'generatedAt': j.get('generatedAt') or j.get('ts')})
+    f = j.get('funnel') or {}
+    for k in ['windowsSeen','entries','fills','filledShares','resolvedGamma','resolvedBookFallback','resolvedWindowsWithFills','winWindows','lossWindows','realizedPnlUsd','marketsTracked','activeMarkets','adverseEvents','pendingMarkouts']:
+        if k in f: row[k] = f[k]
+    if 'variants' in j:
+        row['variants'] = []
+        for vid, v in (j.get('variants') or {}).items():
+            row['variants'].append({'id': vid, 'entries': v.get('entries'), 'resolved': v.get('resolvedEntries') or v.get('resolvedFilledEntries'), 'wins': v.get('wins'), 'losses': v.get('losses'), 'pnl': v.get('realizedPnl') or v.get('realizedPnlUsd'), 'wilsonLB95': v.get('wilsonLB95'), 'breakevenWinRate': v.get('breakevenWinRate'), 'passed': (v.get('preregistration') or {}).get('passed')})
+    if 'byStrategy' in j:
+        row['markets'] = j.get('markets'); row['positions'] = j.get('positions')
+        row['strategies'] = [{'id': (r.get('strategy') or {}).get('id'), 'positions': r.get('positions'), 'firstFills': r.get('firstFills'), 'resetPlaced': r.get('resetPlaced'), 'resetFills': r.get('resetFills'), 'resolved': r.get('resolved'), 'pnl': r.get('totalRealizedPnl'), 'openLockedGross': r.get('openLockedGross')} for r in j.get('byStrategy', [])]
+    if 'markets' in j and isinstance(j['markets'], list):
+        row['marketsTracked'] = len(j['markets'])
+        row['filledMarkets'] = sum(1 for m in j['markets'] if ((m.get('counters') or {}).get('fillsBid',0) or (m.get('counters') or {}).get('fillsAsk',0)))
+        row['realizedSpreadUsd'] = round(sum(float(m.get('realizedSpreadUsd') or 0) for m in j['markets']), 4)
+        row['rewardUsdPerDayEst'] = round(sum(float(((m.get('rewards') or {}).get('estUsdPerDayAtLivePool')) or 0) for m in j['markets']), 4)
+    if 'positions' in j and isinstance(j['positions'], dict):
+        row['positionStats'] = {k:v for k,v in j['positions'].items() if isinstance(v, (int,float))}
+    for k in ['windows','decisions','trades','resolved','wins','losses','holdPnl','tpPnl','open']:
+        if k in j: row[k] = j[k]
+    passed = any(v.get('passed') for v in row.get('variants', []))
+    if passed:
+        verdict = 'PASS_GATE'
+    elif row.get('paperOnly') is True or row.get('signedOrders') == 0 or family == 'taker/cvd-tail':
+        verdict = 'PAPER_COLLECTING'
+    else:
+        verdict = 'CHECK_MODE'
+    pnl = row.get('realizedPnlUsd') or row.get('realizedPnl')
+    if isinstance(pnl, (int,float)) and pnl < 0 and (row.get('fills') or row.get('entries') or 0) > 30:
+        verdict = 'NEGATIVE_SO_FAR'
+    row['verdict'] = verdict
+    return row
+
+
+def collect_paper_lanes():
+    try:
+        screens = os.popen('screen -ls 2>/dev/null').read()
+    except Exception:
+        screens = ''
+    lane_defs = [
+        ('Funded-pool mid-maker','maker/income','/Users/am/poly-funded-maker-paper/summaries/latest.json','pm_midmaker_funded_paper'),
+        ('Esports pool maker','maker/income','/Users/am/poly-esports-pool-maker-paper/summaries/latest.json','pm_esports_pool_maker_paper'),
+        ('LoL match maker','maker/esports','/Users/am/poly-lol-mm/bot/summary.json','pm_lol_maker_paper'),
+        ('BTC spotgate maker','maker/crypto5m','/Users/am/poly-spotgate-maker-paper/summaries/latest.json','pm_spotgate_maker_btc5m_paper'),
+        ('ETH spotgate maker','maker/crypto5m','/Users/am/poly-spotgate-eth-paper/summaries/latest.json','pm_spotgate_maker_eth5m_paper'),
+        ('BTC leadlag taker','taker/crypto5m','/Users/am/poly-leadlag-paper/summaries/latest.json','pm_leadlag_btc5m_paper'),
+        ('ETH leadlag taker','taker/crypto5m','/Users/am/poly-leadlag-eth-paper/summaries/latest.json','pm_leadlag_eth5m_paper'),
+        ('Deep-tail fade','taker/fade','/Users/am/poly-deeptail-fade-paper/summaries/latest.json','pm_fade_btc5m_paper'),
+        ('Late-favorite sell','maker/latefav','/Users/am/poly-latefav-sell-paper/summaries/latest.json','pm_latefav_sell_paper'),
+        ('Slow favorite T-3h','taker/slow','/Users/am/poly-slowfav-paper/summaries/latest.json','pm_slowfav_t3h_paper'),
+        ('Crypto daily mid-maker','maker/daily-crypto','/Users/am/poly-daily-maker-paper/summaries/latest.json','pm_midmaker_daily_paper'),
+        ('Weather undercut complete-set','complete-set','/Users/am/poly-thin-complete-set-paper/weather-undercut/summaries/latest.json','poly_cs_paper_weather_undercut'),
+        ('HYPE complete-set 5m s5','complete-set','/Users/am/poly-hype-complete-set/paper-5m-s5/summaries/latest.json','poly_hype_paper_5m_s5'),
+        ('HYPE complete-set 5m s100','complete-set','/Users/am/poly-hype-complete-set/paper-5m-s100/summaries/latest.json','poly_hype_paper_5m_s100'),
+        ('HYPE complete-set 15m s5','complete-set','/Users/am/poly-hype-complete-set/paper-15m-s5/summaries/latest.json','poly_hype_paper_15m_s5'),
+        ('HYPE complete-set 15m favlow','complete-set','/Users/am/poly-hype-complete-set/paper-15m-favlow/summaries/latest.json','poly_hype_paper_15m_favlow'),
+        ('HYPE complete-set 15m s100','complete-set','/Users/am/poly-hype-complete-set/paper-15m-s100/summaries/latest.json','poly_hype_paper_15m_s100'),
+        ('Target complete-set 5','complete-set','/Users/am/poly-complete-set-targets/paper-5/summaries/latest.json','poly_cs_target_5'),
+        ('Target complete-set 100','complete-set','/Users/am/poly-complete-set-targets/paper-100/summaries/latest.json','poly_cs_target_100'),
+        ('Thin cs DOGE15M','complete-set','/Users/am/poly-thin-complete-set-paper/doge15m/summaries/latest.json','poly_cs_paper_crypto_doge15m'),
+        ('Thin cs LoL','complete-set','/Users/am/poly-thin-complete-set-paper/lol/summaries/latest.json','poly_cs_paper_lol'),
+        ('Thin cs sports','complete-set','/Users/am/poly-thin-complete-set-paper/sports/summaries/latest.json','poly_cs_paper_sports'),
+        ('Thin cs weather','complete-set','/Users/am/poly-thin-complete-set-paper/weather/summaries/latest.json','poly_cs_paper_weather'),
+    ]
+    for asset in ['btc','eth','sol','doge']:
+        for tf in ['5m','15m']:
+            lane_defs.append((f'CVD tail {asset.upper()}{tf}', 'taker/cvd-tail', f'/Users/am/Code/autonomous-polymarket-trader-openspec-crypto-tail-port/artifacts/crypto-tail-paper/{asset}{tf}/summary.json', f'pm_tail_{asset}{tf}'))
+    lanes = [summarize_lane(*x, screens_text=screens) for x in lane_defs]
+    gate_text = ''
+    try:
+        gate_text = os.popen('cd /Users/am/Code/autonomous-polymarket-trader-openspec && node research/crow-deploy/check-gates.mjs 2>/dev/null').read()[:6000]
+    except Exception:
+        pass
+    return {'generatedAt': datetime.now(timezone.utc).isoformat(), 'screensMatched': sum(1 for x in lanes if x.get('running')), 'summariesReadable': sum(1 for x in lanes if x.get('exists')), 'lanes': lanes, 'gateCheckerText': gate_text}
+
+
+def render_strategy_extension(snap):
+    pc = snap.get('paper_lanes') or {}
+    lanes = pc.get('lanes') or []
+    def esc(x): return html_lib.escape(str(x))
+    fams = defaultdict(list)
+    for l in lanes: fams[l.get('family','other')].append(l)
+    rows = []
+    for l in lanes:
+        metrics=[]
+        for k in ['entries','fills','resolvedGamma','resolvedWindowsWithFills','winWindows','lossWindows','realizedPnlUsd','marketsTracked','activeMarkets','positions','markets','resolved','wins','losses','holdPnl','tpPnl','rewardUsdPerDayEst','adverseEvents']:
+            if k in l: metrics.append(f'{k}={l[k]}')
+        if l.get('variants'):
+            metrics.append('variants: ' + '; '.join(f"{v.get('id')}:n={v.get('resolved')},w={v.get('wins')},pnl={v.get('pnl')},pass={v.get('passed')}" for v in l.get('variants',[])[:2]))
+        if l.get('strategies'):
+            metrics.append('strategies: ' + '; '.join(f"{v.get('id')}:first={v.get('firstFills')},reset={v.get('resetPlaced')}/{v.get('resetFills')},res={v.get('resolved')}" for v in l.get('strategies',[])[:3]))
+        cls = 'good' if l.get('verdict')=='PASS_GATE' else 'bad' if l.get('verdict')=='NEGATIVE_SO_FAR' else 'warn' if 'MISSING' in str(l.get('verdict')) else ''
+        rows.append(f"<tr><td>{esc(l.get('name'))}</td><td>{esc(l.get('family'))}</td><td>{'yes' if l.get('running') else 'no'}</td><td class='{cls}'>{esc(l.get('verdict'))}</td><td>{esc('; '.join(metrics)[:650])}</td><td><code>{esc(l.get('path'))}</code></td></tr>")
+    fam_cards = ''.join(f"<div class='card'><div class='label'>{esc(f)}</div><div class='metric'>{len(xs)}</div><div class='muted'>{sum(1 for x in xs if x.get('running'))} running / {sum(1 for x in xs if x.get('exists'))} summaries</div></div>" for f,xs in sorted(fams.items()))
+    gate = esc(pc.get('gateCheckerText') or 'gate checker unavailable')
+    return f"""
+<section id='strategy-command'><h2>Polymarket strategy command center — all paper/tape lanes</h2>
+<p class='sub'>This section folds Fable/Crow's deploy branch, complete-set runners, HYPE lanes, funded-maker lanes, lead/lag takers, CVD-tail bots, and tape collectors into the same dashboard as the weekly BTC/Polymarket heatmaps. It is research/paper status only; live arming still requires explicit approval and pre-registered gates.</p>
+<div class='grid'>{fam_cards}</div>
+<div class='twocol'><div class='card'><h3>Machine gate checker</h3><pre style='white-space:pre-wrap;color:#d1fae5'>{gate}</pre></div><div class='card'><h3>Operator roadmap</h3><ul><li>For takers: display N, Wilson lower bound, fee-inclusive breakeven, and positive UTC days.</li><li>For makers: display adverse selection, markouts, queue/cancel risk, pool/rebate estimates separately from realized PnL.</li><li>For complete-set: track first-leg fills, d60 validity, loser walls at 4/7/11c, reset placed, reset fills, and resolved PnL.</li><li>Keep the hour/week heatmaps: they are still the human timing/risk layer.</li></ul></div></div>
+<div class='heatwrap'><table class='heat'><thead><tr><th>Lane</th><th>Family</th><th>Running</th><th>Gate/status</th><th>Current proof metrics</th><th>Artifact</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+</section>
+"""
 
 print('Fetching Binance spot/futures/OI/taker data...', flush=True)
 spot = fetch_klines('https://api.binance.com', '/api/v3/klines')
@@ -551,6 +668,7 @@ snap = {
     'next_markets': next_markets,
     'maker_alpha': maker_alpha,
     'doge15m_complete_set': doge15m,
+    'paper_lanes': collect_paper_lanes(),
     'notes': [
         'Binance spot/futures are public hourly BTCUSDT data from Binance, aggregated by UTC weekday/hour over the lookback window.',
         'Derivatives activity proxies: Binance USD-M futures quote volume, trade count, taker buy share, taker buy/sell ratio, and futures open interest. Historical BTC options volume is not included in this cut.',
@@ -563,6 +681,8 @@ DATA_JSON.write_text(json.dumps(snap, separators=(',', ':')))
 
 html_template = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BTC / Polymarket BTC5M Weekly Activity Rhythm</title><style>:root{--bg:#07080b;--panel:#0f1117;--panel2:#151925;--text:#f5f7fb;--muted:#9aa4b2;--grid:#273043;--accent:#7dd3fc;--hot:#fb923c}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0%,#172033 0,#07080b 38%,#050507 100%);color:var(--text);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1380px;margin:0 auto;padding:34px 22px 70px}h1{font-size:42px;line-height:1.02;margin:0 0 12px;letter-spacing:-.04em}h2{font-size:22px;margin:30px 0 12px}h3{font-size:15px;margin:0 0 8px;color:#dbeafe}.sub{color:var(--muted);max-width:980px;font-size:16px}.pill{display:inline-block;border:1px solid #334155;background:#0b1220;border-radius:999px;padding:5px 10px;margin:4px 6px 4px 0;color:#cbd5e1;font-size:12px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:24px 0}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px}.card{background:linear-gradient(180deg,rgba(21,25,37,.92),rgba(10,12,18,.92));border:1px solid #20283a;border-radius:18px;padding:18px;box-shadow:0 16px 50px rgba(0,0,0,.25)}.metric{font-size:28px;font-weight:750;letter-spacing:-.04em}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}.heatwrap{overflow-x:auto;border:1px solid #20283a;border-radius:16px;background:#0a0d13;padding:12px;margin-bottom:22px}table.heat{border-collapse:separate;border-spacing:3px;width:100%;min-width:900px}.heat th{font-size:11px;color:#94a3b8;font-weight:500;text-align:center;padding:4px}.heat td{height:32px;border-radius:7px;text-align:center;font-size:11px;color:#e5e7eb;border:1px solid rgba(255,255,255,.04);min-width:34px;position:relative}.heat td:hover{outline:2px solid #e0f2fe;z-index:2}.legend{display:flex;gap:8px;align-items:center;color:#94a3b8;font-size:12px;margin:8px 0 14px}.bar{height:9px;width:180px;border-radius:99px;background:linear-gradient(90deg,#111827,#164e63,#0ea5e9,#f59e0b,#ef4444)}.section{display:grid;grid-template-columns:1.3fr .7fr;gap:18px;align-items:start}.note{color:#aab4c3;background:#09111d;border:1px solid #1e293b;border-radius:14px;padding:14px;margin:10px 0}.warn{border-left:3px solid var(--hot)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}ul{padding-left:20px}.suggestions li{margin:10px 0}.small{font-size:12px;color:#94a3b8}a{color:#7dd3fc}@media(max-width:900px){.grid,.twocol,.section{grid-template-columns:1fr}h1{font-size:32px}}</style></head><body><main><div class="pill">UTC heatmaps</div><div class="pill">Binance DAYS_PLACEHOLDERd baseline</div><div class="pill">Polymarket local CLOB tape</div><div class="pill">paper/research only</div><h1>BTC / BTC5M Weekly Liquidity Rhythm</h1><p class="sub">A shareable operating dashboard for deciding when BTC5M bots are swimming with liquidity vs. being exposed to thin overnight/weekend microstructure. Cells are weekday × UTC hour. Binance metrics are averaged over the last DAYS_PLACEHOLDER days; Polymarket BTC5M cells come from Studio1 local CLOB tape <span class="mono">last_trade_price</span> events.</p><div class="grid" id="cards"></div><div class="note warn"><b>Read this correctly:</b> high BTC futures volume/open interest means the global BTC market is active; it does not prove Polymarket BTC5M edge. Thin hours are risk flags for stale quotes, whale impact, and adverse selection. Options history is not in this cut; futures/open-interest/taker flow are used as derivatives proxies.</div><div class="twocol"><div class="card"><h3>Polymarket tape coverage</h3><div id="coverage"></div></div><div class="card"><h3>Deribit BTC options snapshot</h3><div id="deribit"></div></div></div><div class="card"><h3>Ten upgrades to make this more profitable</h3><ol class="suggestions" id="suggestions"></ol></div><div class="twocol"><div class="card"><h3>First-pass bot schedule</h3><div id="schedule"></div></div><div class="card"><h3>Recommended next-market scan</h3><div id="nextmarkets"></div></div></div><div class="twocol"><div class="card"><h3>Complete-set maker alpha: thin loser walls</h3><div id="makeralpha"></div></div><div class="card"><h3>DOGE15M live thin-book monitor</h3><div id="dogecomplete"></div></div></div><div id="heatmaps"></div><h2>Operational takeaways</h2><div class="section"><div class="card"><h3>How to use this for bots</h3><ul><li>Prefer evaluation/trading windows where futures volume, trade count, and Polymarket BTC5M trade events are simultaneously high.</li><li>Treat low-volume UTC night/weekend cells as adverse-selection zones: widen gates, reduce size, or disable maker quotes.</li><li>Compare weekday vs weekend: if weekend derivatives activity is low and range is high, avoid strategies trained on weekday flow.</li><li>For BTC5M specifically, each UTC hour contains 12 market resolutions. <span class="mono">markets_touched</span> approximates how many 5m windows had local observed trades.</li></ul></div><div class="card"><h3>Data caveats</h3><div id="notes"></div></div></div><script id="snapshot" type="application/json">SNAPSHOT_JSON_PLACEHOLDER</script><script>const S=JSON.parse(document.getElementById('snapshot').textContent);const WD=S.weekday_labels;function flat(mat){return mat.flat().filter(x=>Number.isFinite(x));}function fmt(v,kind){if(v==null)return'—';if(kind==='usd')return'$'+(v>=1e9?(v/1e9).toFixed(2)+'B':v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v.toFixed(0));if(kind==='pct')return v.toFixed(2)+'%';if(kind==='num')return v>=1000?(v/1000).toFixed(1)+'k':v.toFixed(1);return String(Math.round(v));}function color(v,vals){const min=Math.min(...vals),max=Math.max(...vals);const t=max>min?(v-min)/(max-min):0;const hue=220-210*t;return `hsl(${hue} 70% ${12+42*t}%)`;}function heat(title,mat,kind,desc){const vals=flat(mat);let html=`<h2>${title}</h2><p class="sub">${desc}</p><div class="legend"><span>low</span><div class="bar"></div><span>high</span></div><div class="heatwrap"><table class="heat"><thead><tr><th>day/hour</th>${S.hour_labels.map(h=>`<th>${h.slice(0,2)}</th>`).join('')}</tr></thead><tbody>`;for(let d=0;d<7;d++){html+=`<tr><th>${WD[d]}</th>`;for(let h=0;h<24;h++){const v=mat[d][h]||0;html+=`<td style="background:${color(v,vals)}" title="${WD[d]} ${S.hour_labels[h]} UTC: ${fmt(v,kind)}">${kind==='usd'?fmt(v,kind).replace('$',''):fmt(v,kind).replace('%','')}</td>`;}html+='</tr>';}return html+'</tbody></table></div>';}const B=S.binance_metrics,P=S.polymarket,PNL=S.bot_pnl,MR=S.maker_risk,F5=S.five_minute,DOPT=S.deribit_options,MA=S.maker_alpha,CS=S.doge15m_complete_set;document.getElementById('cards').innerHTML=[['Binance hours',S.binance_hours.toLocaleString(),`${S.days}d hourly sample`],['Avg futures volume',fmt(flat(B.futures_quote_usd).reduce((a,b)=>a+b,0)/flat(B.futures_quote_usd).length,'usd'),'BTCUSDT perp quote volume / hour'],['Avg range',fmt(flat(B.range_pct).reduce((a,b)=>a+b,0)/flat(B.range_pct).length,'pct'),'high-low/open per hour'],['PM tape trades',P.meta.events.toLocaleString(),`${P.meta.processed_files.length} local files parsed`]].map(c=>`<div class="card"><div class="label">${c[0]}</div><div class="metric">${c[1]}</div><div class="sub">${c[2]}</div></div>`).join('');document.getElementById('coverage').innerHTML=`<p><b>${P.meta.events.toLocaleString()}</b> BTC5M trade events, <b>${fmt(P.meta.bytes_scanned,'num')}</b> bytes scanned.</p><p>First event: <span class="mono">${P.meta.first_event_utc||'n/a'}</span><br>Last event: <span class="mono">${P.meta.last_event_utc||'n/a'}</span></p><p class="small">${P.meta.missing_manifest_files}</p>`;document.getElementById('deribit').innerHTML=DOPT.status==='ok'?`<p><b>${fmt(DOPT.volume_usd_24h,'usd')}</b> 24h BTC options volume, <b>${DOPT.open_interest_btc.toLocaleString()}</b> BTC open interest.</p><p>Avg mark IV: <b>${DOPT.avg_mark_iv}%</b><br>Instruments: <b>${DOPT.instrument_count}</b></p><p class="small">${DOPT.source}</p>`:`<p class="small">Deribit unavailable: ${DOPT.error||DOPT.status}</p>`;document.getElementById('suggestions').innerHTML=S.suggestions.map(s=>`<li><b>${s.title}</b><br><span class="small">${s.why}</span></li>`).join('');const danger=S.bot_schedule.filter(x=>x.action==='DISABLE_OR_COLLECT_ONLY').slice(0,12);document.getElementById('schedule').innerHTML=`<p><b>${danger.length}</b> highest-risk weekday/hour buckets shown below. Use as a first-pass no-trade/collect-only map, not a live instruction.</p>`+danger.map(x=>`<p class="small"><b>${x.day} ${String(x.hour_utc).padStart(2,'0')}:00 UTC</b> — ${x.action} (${x.reasons.join(', ')||'baseline'})</p>`).join('');document.getElementById('nextmarkets').innerHTML=S.next_markets.map(m=>m.error?`<p>${m.error}</p>`:`<p class="small"><b>${m.question}</b><br>${m.tags.join(', ')} · vol24h ${fmt(m.volume24hr,'usd')} · liq ${fmt(m.liquidity,'usd')} · spread ${m.spread??'n/a'}</p>`).join('');function rowTable(rows,cols){return `<table class="heat" style="min-width:0;border-spacing:2px"><thead><tr>${cols.map(c=>`<th>${c[0]}</th>`).join('')}</tr></thead><tbody>${(rows||[]).map(r=>`<tr>${cols.map(c=>`<td style="height:28px;background:#111827">${r[c[1]]??''}</td>`).join('')}</tr>`).join('')}</tbody></table>`;}document.getElementById('makeralpha').innerHTML=MA.status==='ok'?`<p><b>${MA.combinedUniqueWindows}</b> BTC5M windows replayed. Full population is KILL, but thin loser-side ask walls are the live hypothesis.</p><p class="small">Proof rule: N is independent windows, not shares. N&lt;100 = WAIT even if EV/share looks large.</p><h3>Positive thin-wall BTC5M slices</h3>${rowTable(MA.thinWallRows.filter(r=>r.ciLowCents>0).slice(0,12),[['strat','strategy'],['wall','wall'],['N','n'],['EV c','evCents'],['CI low c','ciLowCents'],['dump%','dumpRatePct']])}<h3>Full population baseline</h3>${rowTable(MA.fullPopulation, [['strat','strategy'],['N','n'],['EV c','evCents'],['CI low c','ciLowCents'],['verdict','verdict']])}`:`<p>${MA.status}: ${MA.error||MA.path}</p>`;document.getElementById('dogecomplete').innerHTML=CS.status==='ok'?`<p><b>${CS.paper.markets}</b> DOGE15M markets, <b>${CS.paper.positions}</b> paper positions, <b>${CS.eventLines.toLocaleString()}</b> raw tape lines.</p><p class="small">paperOnly=${CS.paper.paperOnly}; signedOrders=${CS.paper.signedOrders}; postedOrders=${CS.paper.postedOrders}; first fills so far: ${(CS.paper.byStrategy||[]).reduce((a,b)=>a+(b.firstFills||0),0)}. Live candidate is always false until explicit approval.</p><h3>Proof meter by strategy</h3>${rowTable(CS.proofCounters||[], [['strat','strategy'],['pos','positions'],['first','firstFills'],['reset placed','resetPlaced'],['reset fills','resetFills'],['N','resolvedN'],['PnL','totalRealizedPnl'],['EV/N','evPerResolved'],['band','nBand']])}<p class="small">Rules: ${CS.proofRules.wait}; ${CS.proofRules.candidate}; ${CS.proofRules.serious}.</p><h3>Thinnest current DOGE15M walls</h3>${rowTable((CS.currentThinBooks||[]).slice(0,12), [['slug','slug'],['side','outcome'],['sec left','secondsLeft'],['wall@4c','wall04'],['wall@7c','wall07'],['wall@11c','wall11'],['<100','thinLt100']])}`:`<p>${CS.status}: ${CS.error||''}</p>`;let html='';html+=heat('Composite BTC activity score',S.composite_activity,'num','Z-score blend of Binance futures volume, trade count, and hourly range. Use this as the quickest “how awake is BTC?” map.');html+=heat('Binance BTCUSDT futures quote volume — mean USD/hour',B.futures_quote_usd,'usd','Primary global derivatives liquidity proxy. Thin cells are where whales can move local microstructure more easily.');html+=heat('Binance BTCUSDT spot quote volume — mean USD/hour',B.spot_quote_usd,'usd','Spot market participation by weekday/hour.');html+=heat('Hourly BTC range — mean %',B.range_pct,'pct','Price variance proxy: high range with low volume is especially dangerous for stale BTC5M makers.');html+=heat('Futures taker buy share — mean %',B.taker_buy_share_pct,'pct','Directional taker aggression proxy. Deviations from 50% show one-sided futures pressure.');html+=heat('Futures open interest — mean USD',B.open_interest_usd,'usd','Derivative positioning/open interest proxy. High OI with low volume can mean liquidation/stop-run risk.');html+=heat('Bot realized PnL — average USD/trade by close hour',PNL.avg_pnl_usd,'usd','Parsed local trades.jsonl CLOSE/RESOLVE/TP rows. This is the money overlay: which weekday/hour buckets actually made or lost money in paper/live-shadow artifacts.');html+=heat('Bot trade count — closed/scored positions',PNL.trade_count,'num','Sample size behind the PnL heatmap. Low-count buckets are not trustworthy yet.');html+=heat('Binance 5m whale / large-move count',F5.whale_or_large_move_count,'num','Count of 5-minute candles in each hour bucket above the 95th percentile for volume or range.');html+=heat('Thin-liquidity big-move count',F5.thin_bigmove_count,'num','Danger regime: low 5m quote volume but high range. Good candidate for no-trade / reduced-size rules.');html+=heat('Average 5m BTC range — %',F5.avg_5m_range_pct,'pct','Direct 5-minute volatility view rather than hourly smoothing.');html+=heat('Maker queue-risk score',MR.queue_risk_score,'num','Composite of spread, late-window trade intensity, and shallow top depth from BTC5M CLOB book/trade tape. Higher = more adverse-selection risk.');html+=heat('Average Polymarket BTC5M spread',MR.avg_spread,'pct','Average best ask minus best bid from local CLOB book events. Wide spreads imply taker cost; narrow spreads can still be toxic if queue risk is high.');html+=heat('Late-window BTC5M trade count',MR.late_trade_count,'num','Trades inside the last 60 seconds before market end. This approximates resolution-window intensity and last-minute flip pressure.');html+=heat('Polymarket BTC5M local trade notional — raw USD/hour',P.notional_usd_raw,'usd','Local Studio1 CLOB websocket tape. Not averaged over 60d; this is observed BTC5M Polymarket trade flow in parsed chunks and historical one-off orderbook tapes still present.');html+=heat('Polymarket BTC5M trade events — raw count/hour',P.trade_events,'num','Number of local BTC5M last_trade_price events seen by hour.');html+=heat('Polymarket BTC5M windows touched — count/hour',P.markets_touched,'num','How many 5-minute BTC up/down market slugs traded in that UTC hour in the local tape; max is roughly 12 per hour per side/window set.');document.getElementById('heatmaps').innerHTML=html;document.getElementById('notes').innerHTML=S.notes.map(n=>`<p>${n}</p>`).join('')+`<p class="mono">generated_at_utc=${S.generated_at_utc}</p>`;</script></main></body></html>'''
 html = html_template.replace('DAYS_PLACEHOLDER', str(DAYS)).replace('SNAPSHOT_JSON_PLACEHOLDER', json.dumps(snap))
+strategy_extension = render_strategy_extension(snap)
+html = html.replace('</main>', strategy_extension + '</main>') if '</main>' in html else html + strategy_extension
 OUT.write_text(html)
 print(f'wrote {OUT} bytes={OUT.stat().st_size}')
 print(f'wrote {DATA_JSON} bytes={DATA_JSON.stat().st_size}')
