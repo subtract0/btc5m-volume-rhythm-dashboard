@@ -240,13 +240,30 @@ def summarize_lane(name, family, path, screen_name=None, screens_text=''):
     row = {'name': name, 'family': family, 'path': str(p), 'screen': screen_name, 'running': bool(screen_name and screen_name in screens_text), 'exists': p.exists()}
     if not p.exists():
         row['verdict'] = 'MISSING_SUMMARY'
+        row['freshnessStatus'] = 'MISSING_SUMMARY'
+        row['observabilityStatus'] = 'MISSING_SUMMARY'
         return row
     try:
         j = json.load(open(p))
     except Exception as ex:
-        row.update({'verdict':'BAD_JSON','error':str(ex)})
+        row.update({'verdict':'BAD_JSON','freshnessStatus':'BAD_JSON','observabilityStatus':'BAD_JSON','error':str(ex)})
         return row
-    row.update({'paperOnly': j.get('paperOnly'), 'liveOrderSubmission': j.get('liveOrderSubmission'), 'signedOrders': j.get('signedOrders'), 'postedOrders': j.get('postedOrders'), 'startedAt': j.get('startedAt') or j.get('ts'), 'generatedAt': j.get('generatedAt') or j.get('ts')})
+    ts = j.get('generatedAt') or j.get('ts') or j.get('updatedAt') or j.get('startedAt')
+    age_sec = None
+    try:
+        if ts:
+            age_sec = time.time() - datetime.fromisoformat(str(ts).replace('Z', '+00:00')).timestamp()
+    except Exception:
+        age_sec = None
+    if age_sec is None:
+        try: age_sec = time.time() - p.stat().st_mtime
+        except Exception: age_sec = None
+    freshness = 'UNKNOWN'
+    if age_sec is not None:
+        if age_sec > 3600: freshness = 'STALE_GT_1H'
+        elif age_sec > 900: freshness = 'WARN_GT_15M'
+        else: freshness = 'FRESH_LT_15M'
+    row.update({'paperOnly': j.get('paperOnly'), 'liveOrderSubmission': j.get('liveOrderSubmission'), 'signedOrders': j.get('signedOrders'), 'postedOrders': j.get('postedOrders'), 'startedAt': j.get('startedAt') or j.get('ts'), 'generatedAt': ts, 'ageSec': round(age_sec, 1) if age_sec is not None else None, 'freshnessStatus': freshness})
     f = j.get('funnel') or {}
     for k in ['windowsSeen','entries','fills','filledShares','resolvedGamma','resolvedBookFallback','resolvedWindowsWithFills','winWindows','lossWindows','realizedPnlUsd','marketsTracked','activeMarkets','adverseEvents','pendingMarkouts']:
         if k in f: row[k] = f[k]
@@ -276,6 +293,16 @@ def summarize_lane(name, family, path, screen_name=None, screens_text=''):
     pnl = row.get('realizedPnlUsd') or row.get('realizedPnl')
     if isinstance(pnl, (int,float)) and pnl < 0 and (row.get('fills') or row.get('entries') or 0) > 30:
         verdict = 'NEGATIVE_SO_FAR'
+    safety_bad = (row.get('paperOnly') is False) or (row.get('liveOrderSubmission') is True) or (row.get('signedOrders') not in [0, None]) or (row.get('postedOrders') not in [0, None])
+    if safety_bad:
+        obs = 'CHECK_MODE_SAFETY'
+    elif row.get('freshnessStatus') in ['STALE_GT_1H','WARN_GT_15M','UNKNOWN']:
+        obs = row.get('freshnessStatus')
+    elif not row.get('running'):
+        obs = 'FRESH_SUMMARY_SCREEN_NOT_MATCHED'
+    else:
+        obs = 'FRESH_PAPER_RUNNING'
+    row['observabilityStatus'] = obs
     row['verdict'] = verdict
     return row
 
@@ -319,7 +346,14 @@ def collect_paper_lanes():
         gate_text = os.popen('cd /Users/am/Code/autonomous-polymarket-trader-openspec && node research/crow-deploy/check-gates.mjs 2>/dev/null').read()[:6000]
     except Exception:
         pass
-    return {'generatedAt': datetime.now(timezone.utc).isoformat(), 'screensMatched': sum(1 for x in lanes if x.get('running')), 'summariesReadable': sum(1 for x in lanes if x.get('exists')), 'lanes': lanes, 'gateCheckerText': gate_text}
+    status_counts = {}
+    for x in lanes:
+        k = x.get('observabilityStatus') or x.get('verdict') or 'UNKNOWN'
+        status_counts[k] = status_counts.get(k, 0) + 1
+    unsafe = sum(1 for x in lanes if x.get('observabilityStatus') == 'CHECK_MODE_SAFETY')
+    stale = sum(1 for x in lanes if 'STALE' in str(x.get('observabilityStatus')) or 'WARN_GT_15M' == x.get('observabilityStatus'))
+    missing = sum(1 for x in lanes if x.get('observabilityStatus') in ['MISSING_SUMMARY','BAD_JSON'])
+    return {'generatedAt': datetime.now(timezone.utc).isoformat(), 'screensMatched': sum(1 for x in lanes if x.get('running')), 'summariesReadable': sum(1 for x in lanes if x.get('exists')), 'statusCounts': status_counts, 'unsafeModeCount': unsafe, 'staleCount': stale, 'missingCount': missing, 'liveApproved': False, 'lanes': lanes, 'gateCheckerText': gate_text}
 
 
 def render_strategy_extension(snap):
@@ -337,16 +371,24 @@ def render_strategy_extension(snap):
             metrics.append('variants: ' + '; '.join(f"{v.get('id')}:n={v.get('resolved')},w={v.get('wins')},pnl={v.get('pnl')},pass={v.get('passed')}" for v in l.get('variants',[])[:2]))
         if l.get('strategies'):
             metrics.append('strategies: ' + '; '.join(f"{v.get('id')}:first={v.get('firstFills')},reset={v.get('resetPlaced')}/{v.get('resetFills')},res={v.get('resolved')}" for v in l.get('strategies',[])[:3]))
-        cls = 'good' if l.get('verdict')=='PASS_GATE' else 'bad' if l.get('verdict')=='NEGATIVE_SO_FAR' else 'warn' if 'MISSING' in str(l.get('verdict')) else ''
-        rows.append(f"<tr><td>{esc(l.get('name'))}</td><td>{esc(l.get('family'))}</td><td>{'yes' if l.get('running') else 'no'}</td><td class='{cls}'>{esc(l.get('verdict'))}</td><td>{esc('; '.join(metrics)[:650])}</td><td><code>{esc(l.get('path'))}</code></td></tr>")
-    fam_cards = ''.join(f"<div class='card'><div class='label'>{esc(f)}</div><div class='metric'>{len(xs)}</div><div class='muted'>{sum(1 for x in xs if x.get('running'))} running / {sum(1 for x in xs if x.get('exists'))} summaries</div></div>" for f,xs in sorted(fams.items()))
+        obs = l.get('observabilityStatus') or l.get('verdict')
+        cls = 'good' if obs=='FRESH_PAPER_RUNNING' else 'bad' if obs in ['CHECK_MODE_SAFETY','BAD_JSON'] or 'STALE' in str(obs) else 'warn' if obs not in ['FRESH_PAPER_RUNNING'] else ''
+        age = '—' if l.get('ageSec') is None else (str(round(l.get('ageSec')/60,1)) + 'm')
+        safety = f"paper={l.get('paperOnly')} live={l.get('liveOrderSubmission')} signed={l.get('signedOrders')} posted={l.get('postedOrders')}"
+        rows.append(f"<tr><td>{esc(l.get('name'))}</td><td>{esc(l.get('family'))}</td><td>{'yes' if l.get('running') else 'no'}</td><td class='{cls}'>{esc(obs)}</td><td>{esc(age)}</td><td>{esc(safety)}</td><td>{esc('; '.join(metrics)[:650])}</td><td><code>{esc(l.get('path'))}</code></td></tr>")
+    fam_cards = ''.join(f"<div class='card'><div class='label'>{esc(f)}</div><div class='metric'>{len(xs)}</div><div class='sub'>{sum(1 for x in xs if x.get('running'))} running / {sum(1 for x in xs if x.get('exists'))} summaries</div></div>" for f,xs in sorted(fams.items()))
     gate = esc(pc.get('gateCheckerText') or 'gate checker unavailable')
+    counts = pc.get('statusCounts') or {}
+    count_cards = ''.join(f"<div class='card'><div class='label'>{esc(k)}</div><div class='metric'>{v}</div></div>" for k,v in sorted(counts.items()))
+    live_state = 'LIVE APPROVED' if pc.get('liveApproved') else 'NOT LIVE APPROVED'
     return f"""
-<section id='strategy-command'><h2>Polymarket strategy command center — all paper/tape lanes</h2>
-<p class='sub'>This section folds Fable/Crow's deploy branch, complete-set runners, HYPE lanes, funded-maker lanes, lead/lag takers, CVD-tail bots, and tape collectors into the same dashboard as the weekly BTC/Polymarket heatmaps. It is research/paper status only; live arming still requires explicit approval and pre-registered gates.</p>
-<div class='grid'>{fam_cards}</div>
-<div class='twocol'><div class='card'><h3>Machine gate checker</h3><pre style='white-space:pre-wrap;color:#d1fae5'>{gate}</pre></div><div class='card'><h3>Operator roadmap</h3><ul><li>For takers: display N, Wilson lower bound, fee-inclusive breakeven, and positive UTC days.</li><li>For makers: display adverse selection, markouts, queue/cancel risk, pool/rebate estimates separately from realized PnL.</li><li>For complete-set: track first-leg fills, d60 validity, loser walls at 4/7/11c, reset placed, reset fills, and resolved PnL.</li><li>Keep the hour/week heatmaps: they are still the human timing/risk layer.</li></ul></div></div>
-<div class='heatwrap'><table class='heat'><thead><tr><th>Lane</th><th>Family</th><th>Running</th><th>Gate/status</th><th>Current proof metrics</th><th>Artifact</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+<section id='strategy-command'><h2>Polymarket strategy command center — freshness, gates, safety</h2>
+<p class='sub'>Operator observability layer generated from live Studio1 summaries and screens. It exposes stale/missing lanes, paper/live safety flags, gate-checker output, and proof metrics alongside the weekly BTC/Polymarket heatmaps. Live arming remains false until explicit approval.</p>
+<div class='grid'><div class='card'><div class='label'>Live state</div><div class='metric'>{live_state}</div><div class='sub'>Dashboard is status/proof only.</div></div><div class='card'><div class='label'>Screens matched</div><div class='metric'>{pc.get('screensMatched')}</div><div class='sub'>{pc.get('summariesReadable')} readable summaries</div></div><div class='card'><div class='label'>Stale lanes</div><div class='metric'>{pc.get('staleCount')}</div><div class='sub'>Warn if &gt;15m, stale if &gt;1h</div></div><div class='card'><div class='label'>Missing/bad summaries</div><div class='metric'>{pc.get('missingCount')}</div><div class='sub'>Must be resolved before trusting aggregate claims</div></div></div>
+<h3>Status counts</h3><div class='grid'>{count_cards}</div>
+<h3>Families</h3><div class='grid'>{fam_cards}</div>
+<div class='twocol'><div class='card'><h3>Machine gate checker</h3><pre style='white-space:pre-wrap;color:#d1fae5'>{gate}</pre></div><div class='card'><h3>Operator roadmap</h3><ul><li>For takers: N, Wilson lower bound, fee-inclusive breakeven, and positive UTC days.</li><li>For makers: adverse selection, markouts, queue/cancel risk, pool/rebate estimates separate from realized PnL.</li><li>For complete-set: first-leg fills, d60 validity, loser walls at 4/7/11c, reset placed, reset fills, and resolved PnL.</li><li>Do not trust stale dashboards: freshness is a gate, not decoration.</li></ul></div></div>
+<div class='heatwrap'><table class='heat'><thead><tr><th>Lane</th><th>Family</th><th>Running</th><th>Observability</th><th>Age</th><th>Safety flags</th><th>Current proof metrics</th><th>Artifact</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
 </section>
 """
 
